@@ -1549,8 +1549,13 @@ static bool cmd_write(Vis *vis, Win *win, Command *cmd, const char *argv[], Sele
 
 		TextSave ctx = text_save_default(.txt = text, .method = file->save_method, .filepath = path);
 		if (!text_save_begin(&ctx)) {
-			const char *msg = errno ? strerror(errno) : "try changing `:set savemethod`";
-			vis_info_show(vis, "Can't write `%.*s': %s", (int)path.length, path.data, msg);
+			if (ctx.method == TEXT_SAVE_ATOMIC && errno)
+				vis_info_show(vis, "Can't write `%.*s': %s (atomic save failed; the file is left unchanged, try `:set savemethod=inplace')",
+				              (int)path.length, path.data, strerror(errno));
+			else if (errno)
+				vis_info_show(vis, "Can't write `%.*s': %s", (int)path.length, path.data, strerror(errno));
+			else
+				vis_info_show(vis, "Can't write `%.*s': try changing `:set savemethod'", (int)path.length, path.data);
 			goto err;
 		}
 
@@ -1572,7 +1577,11 @@ static bool cmd_write(Vis *vis, Win *win, Command *cmd, const char *argv[], Sele
 		}
 
 		if (failure) {
-			vis_info_show(vis, "Can't write `%.*s': %s", (int)path.length, path.data, strerror(errno));
+			if (ctx.method == TEXT_SAVE_ATOMIC)
+				vis_info_show(vis, "Can't write `%.*s': %s (atomic save couldn't be completed; the buffer is left unsaved, try `:set savemethod=inplace')",
+				              (int)path.length, path.data, strerror(errno));
+			else
+				vis_info_show(vis, "Can't write `%.*s': %s", (int)path.length, path.data, strerror(errno));
 			goto err;
 		}
 

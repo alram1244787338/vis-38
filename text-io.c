@@ -314,6 +314,20 @@ err:
 	saved_errno = errno;
 	if (oldfd != -1)
 		close(oldfd);
+	/* If we already created the temporary file but failed to finish
+	 * preparing it (e.g. ownership/ACL could not be preserved, which is
+	 * common on file systems such as sshfs), release it right here. This
+	 * avoids both leaking the descriptor when text_save_begin falls back to
+	 * another method and leaving a stray `.<name>.vis.*` file behind. */
+	if (ctx->fd != -1) {
+		close(ctx->fd);
+		ctx->fd = -1;
+		if (ctx->tmpname.data && ctx->tmpname.data[0])
+			unlinkat(ctx->dirfd, (char *)ctx->tmpname.data, 0);
+	}
+	free(ctx->tmpname.data);
+	ctx->tmpname.data = NULL;
+	ctx->tmpname.length = 0;
 	errno = saved_errno;
 	return false;
 }
@@ -331,9 +345,22 @@ static bool text_save_commit_atomic(TextSave *ctx) {
 	if (close_failed)
 		return false;
 
-	if (renameat(ctx->dirfd, (char *)ctx->tmpname.data, ctx->dirfd, (char *)ctx->filepath.data) == -1)
+	if (renameat(ctx->dirfd, (char *)ctx->tmpname.data, ctx->dirfd, (char *)ctx->filepath.data) == -1) {
+		/* The atomic replace itself failed (e.g. a cross-device rename, or a
+		 * file system such as sshfs that rejects the operation). The
+		 * destination file is left untouched, so remove our temporary file
+		 * right here: a failed commit must never leave `.<name>.vis.*` files
+		 * lying around in the working directory. We then clear tmpname so the
+		 * text_save_cancel that always follows a commit does not try to
+		 * unlink it a second time. */
+		int rename_errno = errno;
+		unlinkat(ctx->dirfd, (char *)ctx->tmpname.data, 0);
+		free(ctx->tmpname.data);
+		ctx->tmpname.data = 0;
+		ctx->tmpname.length = 0;
+		errno = rename_errno;
 		return false;
-
+	}
 
 	str8 directory;
 	path_split(ctx->tmpname, &directory, 0);
