@@ -261,7 +261,7 @@ err:
  */
 static bool text_save_begin_atomic(TextSave *ctx)
 {
-	int oldfd, saved_errno;
+	int oldfd = -1, saved_errno;
 	if ((oldfd = openat(ctx->dirfd, (char *)ctx->filepath.data, O_RDONLY)) == -1 && errno != ENOENT)
 		goto err;
 	struct stat oldmeta = { 0 };
@@ -314,6 +314,20 @@ err:
 	saved_errno = errno;
 	if (oldfd != -1)
 		close(oldfd);
+	/* If mkstempat succeeded, clean up the temporary file so we don't leave
+	 * orphaned .vis.XXXXXX files in the working directory. This matters
+	 * especially on network filesystems (sshfs, etc.) where stale temp
+	 * files accumulate visibly. */
+	if (ctx->fd != -1) {
+		close(ctx->fd);
+		ctx->fd = -1;
+	}
+	if (ctx->tmpname.data && ctx->tmpname.data[0]) {
+		unlinkat(ctx->dirfd, (char *)ctx->tmpname.data, 0);
+		free(ctx->tmpname.data);
+		ctx->tmpname.data = NULL;
+		ctx->tmpname.length = 0;
+	}
 	errno = saved_errno;
 	return false;
 }
@@ -331,9 +345,21 @@ static bool text_save_commit_atomic(TextSave *ctx) {
 	if (close_failed)
 		return false;
 
-	if (renameat(ctx->dirfd, (char *)ctx->tmpname.data, ctx->dirfd, (char *)ctx->filepath.data) == -1)
+	if (renameat(ctx->dirfd, (char *)ctx->tmpname.data, ctx->dirfd, (char *)ctx->filepath.data) == -1) {
+		/* rename failed: remove the temp file so it doesn't linger.
+		 * Save errno first since unlinkat may clobber it. */
+		int saved_errno = errno;
+		unlinkat(ctx->dirfd, (char *)ctx->tmpname.data, 0);
+		errno = saved_errno;
 		return false;
+	}
 
+	/* From this point on the file content has been atomically placed at
+	 * its final destination via rename(2). The data is safe. Remaining
+	 * steps (directory fsync) improve crash durability but their failure
+	 * does not mean the save was lost. We still call text_saved so the
+	 * editor state reflects reality. */
+	text_saved(ctx->txt, &meta);
 
 	str8 directory;
 	path_split(ctx->tmpname, &directory, 0);
@@ -347,17 +373,14 @@ static bool text_save_commit_atomic(TextSave *ctx) {
 	ctx->tmpname.data = 0;
 
 	if (dir == -1)
-		return false;
+		return true;
 
 	if (fsync(dir) == -1 && errno != EINVAL) {
 		close(dir);
-		return false;
+		return true;
 	}
 
-	if (close(dir) == -1)
-		return false;
-
-	text_saved(ctx->txt, &meta);
+	close(dir);
 	return true;
 }
 
@@ -415,7 +438,9 @@ static bool text_save_commit_inplace(TextSave *ctx) {
 	struct stat meta = { 0 };
 	if (fstat(ctx->fd, &meta) == -1)
 		return false;
-	if (close(ctx->fd) == -1)
+	bool close_failed = (close(ctx->fd) == -1);
+	ctx->fd = -1;
+	if (close_failed)
 		return false;
 	text_saved(ctx->txt, &meta);
 	return true;
@@ -441,11 +466,15 @@ err:
 
 void text_save_cancel(TextSave *ctx) {
 	int saved_errno = errno;
-	if (ctx->fd != -1)
+	if (ctx->fd != -1) {
 		close(ctx->fd);
+		ctx->fd = -1;
+	}
 	if (ctx->tmpname.data && ctx->tmpname.data[0])
 		unlinkat(ctx->dirfd, (char *)ctx->tmpname.data, 0);
 	free(ctx->tmpname.data);
+	ctx->tmpname.data = NULL;
+	ctx->tmpname.length = 0;
 	errno = saved_errno;
 }
 

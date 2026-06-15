@@ -6,6 +6,8 @@
 #include "buffer.c"
 #include "text.c"
 
+#include <dirent.h>
+
 static Vis *vis;
 
 #ifndef BUFSIZ
@@ -100,6 +102,22 @@ static bool text_save_method(Text *txt, const char *filename, enum TextSaveMetho
 	return text_save_commit(&ctx);
 }
 
+/* Count .vis.XXXXXX temp files left in the given directory (or "." if NULL).
+ * Returns the number of matching entries found. */
+static int count_vis_temp_files(const char *dirpath) {
+	DIR *d = opendir(dirpath ? dirpath : ".");
+	if (!d)
+		return -1;
+	int count = 0;
+	struct dirent *ent;
+	while ((ent = readdir(d)) != NULL) {
+		if (strstr(ent->d_name, ".vis.") != NULL)
+			count++;
+	}
+	closedir(d);
+	return count;
+}
+
 int main(int argc, char *argv[]) {
 	Text *txt;
 
@@ -183,6 +201,94 @@ int main(int argc, char *argv[]) {
 
 			ok(txt && !text_save_method(txt, linkname, TEXT_SAVE_ATOMIC), "Text save %s atomic", names[i]);
 			text_free(txt);
+		}
+
+		/* Verify no .vis.* temp files leaked after all save operations */
+		ok(count_vis_temp_files(".") == 0, "No .vis.* temp files after successful and failed saves");
+
+		/* Test: atomic save failure on symlink must not leave temp files */
+		{
+			const char *linkname = "symlink";
+			unlink(linkname);
+			ok(symlink(filename, linkname) == 0, "symlink creation for temp file cleanup test");
+
+			txt = vis_text_load(vis, linkname, TEXT_LOAD_AUTO);
+			ok(txt != NULL, "Load symlink for atomic failure test");
+			/* atomic save on symlink should fail */
+			bool atomic_failed = !text_save_method(txt, linkname, TEXT_SAVE_ATOMIC);
+			ok(atomic_failed, "Atomic save on symlink correctly fails");
+			/* verify no temp files left behind */
+			ok(count_vis_temp_files(".") == 0, "No .vis.* temp files after atomic save failure on symlink");
+			text_free(txt);
+			unlink(linkname);
+		}
+
+		/* Test: new file save and retry after failure */
+		{
+			const char *newfile = "test-newfile";
+			unlink(newfile);
+
+			/* Save a new file atomically */
+			txt = vis_text_load(vis, 0, TEXT_LOAD_AUTO);
+			ok(txt != NULL, "Load empty text for new file test");
+			snprintf(buf, sizeof buf, "new file content\n");
+			ok(insert(txt, 0, buf), "Insert content for new file");
+			ok(text_save_method(txt, newfile, TEXT_SAVE_ATOMIC), "Atomic save new file succeeds");
+			text_free(txt);
+
+			/* Verify content and no temp files */
+			txt = vis_text_load(vis, newfile, TEXT_LOAD_AUTO);
+			ok(txt && compare(txt, buf), "Verify new file content after atomic save");
+			ok(count_vis_temp_files(".") == 0, "No .vis.* temp files after new file atomic save");
+			text_free(txt);
+
+			/* Try to save to a read-only directory to trigger failure, then retry */
+			const char *rodir = "test-readonly-dir";
+			char ropath[256];
+			snprintf(ropath, sizeof ropath, "%s/file.txt", rodir);
+			mkdir(rodir, 0555);
+
+			txt = vis_text_load(vis, 0, TEXT_LOAD_AUTO);
+			ok(txt != NULL, "Load empty text for read-only dir test");
+			snprintf(buf, sizeof buf, "should fail\n");
+			ok(insert(txt, 0, buf), "Insert content for read-only dir test");
+
+			/* This should fail because the directory is read-only */
+			bool ro_failed = !text_save_method(txt, ropath, TEXT_SAVE_ATOMIC);
+			ok(ro_failed, "Atomic save to read-only directory fails");
+			ok(count_vis_temp_files(rodir) == 0, "No .vis.* temp files in read-only dir after failure");
+
+			/* Now fix permissions and retry - should succeed */
+			chmod(rodir, 0755);
+			ok(text_save_method(txt, ropath, TEXT_SAVE_ATOMIC), "Atomic save retry after permission fix succeeds");
+			ok(count_vis_temp_files(rodir) == 0, "No .vis.* temp files after successful retry");
+			text_free(txt);
+
+			/* Verify the retried file content */
+			txt = vis_text_load(vis, ropath, TEXT_LOAD_AUTO);
+			ok(txt && compare(txt, buf), "Verify content after retry save");
+			text_free(txt);
+
+			/* Cleanup */
+			unlink(ropath);
+			rmdir(rodir);
+			unlink(newfile);
+		}
+
+		/* Test: inplace save on symlink (fallback path) leaves no temp files */
+		{
+			const char *linkname = "symlink";
+			unlink(linkname);
+			ok(symlink(filename, linkname) == 0, "symlink creation for inplace test");
+
+			txt = vis_text_load(vis, linkname, TEXT_LOAD_AUTO);
+			ok(txt != NULL, "Load symlink for inplace save test");
+			snprintf(buf, sizeof buf, "inplace via symlink\n");
+			ok(insert(txt, 0, buf), "Insert content for inplace symlink save");
+			ok(text_save_method(txt, linkname, TEXT_SAVE_INPLACE), "Inplace save via symlink succeeds");
+			ok(count_vis_temp_files(".") == 0, "No .vis.* temp files after inplace save on symlink");
+			text_free(txt);
+			unlink(linkname);
 		}
 	}
 

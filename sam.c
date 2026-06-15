@@ -1549,7 +1549,9 @@ static bool cmd_write(Vis *vis, Win *win, Command *cmd, const char *argv[], Sele
 
 		TextSave ctx = text_save_default(.txt = text, .method = file->save_method, .filepath = path);
 		if (!text_save_begin(&ctx)) {
-			const char *msg = errno ? strerror(errno) : "try changing `:set savemethod`";
+			const char *msg = errno ? strerror(errno)
+				: "atomic save not supported for this file (symlink/hardlink), "
+				  "try `:set savemethod inplace`";
 			vis_info_show(vis, "Can't write `%.*s': %s", (int)path.length, path.data, msg);
 			goto err;
 		}
@@ -1572,7 +1574,9 @@ static bool cmd_write(Vis *vis, Win *win, Command *cmd, const char *argv[], Sele
 		}
 
 		if (failure) {
-			vis_info_show(vis, "Can't write `%.*s': %s", (int)path.length, path.data, strerror(errno));
+			vis_info_show(vis, "Can't write `%.*s': %s (try `:set savemethod inplace`)",
+			              (int)path.length, path.data,
+			              errno ? strerror(errno) : "I/O error during atomic save");
 			goto err;
 		}
 
